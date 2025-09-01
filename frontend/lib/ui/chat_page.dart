@@ -2,7 +2,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/ws_client.dart';
-import '../services/audio_recorder.dart'; // Correctly imports our service file
+import '../services/audio_recorder.dart';
 import 'widgets/mic_button.dart';
 import 'widgets/message_bubble.dart';
 
@@ -14,6 +14,7 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
+  // This text controller isn't used for voice, but we can keep it.
   final TextEditingController _textCtrl = TextEditingController();
 
   @override
@@ -33,7 +34,6 @@ class _ChatPageState extends State<ChatPage> {
   @override
   Widget build(BuildContext context) {
     final ws = context.watch<WsClient>();
-    // Use the new class name to get the provider instance
     final rec = context.watch<AudioRecordingService>();
 
     return Scaffold(
@@ -51,10 +51,11 @@ class _ChatPageState extends State<ChatPage> {
         children: [
           Expanded(
             child: ListView.builder(
+              reverse: true, // Show latest messages at the bottom
               padding: const EdgeInsets.all(12),
               itemCount: ws.log.length,
               itemBuilder: (context, index) {
-                final entry = ws.log[index];
+                final entry = ws.log.reversed.toList()[index];
                 final mine = entry.startsWith('WS->');
                 final text = entry.replaceFirst(RegExp(r'^WS[<-]\s*'), '');
                 return MessageBubble(text: text, mine: mine);
@@ -66,15 +67,19 @@ class _ChatPageState extends State<ChatPage> {
       floatingActionButton: MicButton(
         isRecording: rec.isRecording,
         onStart: () async {
-          // Use the correct provider to start recording
+          // --- THIS IS THE CORRECTED LOGIC ---
+          // 1. Start the recording service first. It will wait for audio chunks.
           await context.read<AudioRecordingService>().start(
             onChunk: (Uint8List chunk) {
+              // This callback will now fire correctly *after* audio_start is sent.
               context.read<WsClient>().sendBinary(chunk);
             },
           );
+
+          // 2. NOW that the recorder is listening, tell the backend we are starting.
+          context.read<WsClient>().sendAudioStart(sampleRate: 16000);
         },
         onStop: () async {
-          // Use the correct provider to stop recording
           await context.read<AudioRecordingService>().stop();
           context.read<WsClient>().sendAudioEnd();
         },
