@@ -1,23 +1,23 @@
 """
-FastAPI backend for the Voice Chat POC (Chunk 1 & 2).
+FastAPI backend for the Voice Chat POC (Chunk 1 & 2).
 
-This module defines a simple API and a WebSocket endpoint.  The goal of
-this proof‑of‑concept is to lay the groundwork for a low‑latency
-voice chat system using Azure Cognitive Services.  In this initial
+This module defines a simple API and a WebSocket endpoint. The goal of
+this proof-of-concept is to lay the groundwork for a low-latency
+voice chat system using Azure Cognitive Services. In this initial
 iteration we implement:
 
 * A health check at `/health` to verify the service is running.
-* A WebSocket endpoint at `/ws` that echoes any text payload.  This
+* A WebSocket endpoint at `/ws` that echoes any text payload. This
   will be extended to stream microphone audio and transcripts in later
   chunks.
 * A synchronous POST endpoint at `/stt/recognize_once` that accepts
   small audio files (e.g., WAV/OGG/MP3) and returns the recognised
-  text using Azure Speech‑to‑Text (STT).  This endpoint is intended
-  solely for sanity‑checking your Azure credentials before tackling
+  text using Azure Speech-to-Text (STT). This endpoint is intended
+  solely for sanity-checking your Azure credentials before tackling
   streaming STT.
 
-The backend expects environment variables to be defined in a `.env`
-file at the repository root.  See the provided `.env.example` for
+The backend expects environment variables to be defined in a .env
+file at the repository root. See the provided .env.example for
 details.
 """
 
@@ -25,23 +25,25 @@ import os
 import tempfile
 import shutil
 from typing import Dict, Tuple
+import json
+import base64
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 try:
-    from fastapi import UploadFile, File  # type: ignore
+    from fastapi import UploadFile, File # type: ignore
     # Test import from python-multipart; if missing this will raise ImportError at runtime
-    import multipart  # type: ignore  # noqa: F401
+    import multipart # type: ignore # noqa: F401
     _HAS_MULTIPART = True
 except Exception:
-    # Fallback if python-multipart isn't installed.  We won't register file upload routes.
-    UploadFile = None  # type: ignore
-    File = None  # type: ignore
+    # Fallback if python-multipart isn't installed. We won't register file upload routes.
+    UploadFile = None # type: ignore
+    File = None # type: ignore
     _HAS_MULTIPART = False
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 try:
-    from dotenv import load_dotenv  # type: ignore
-except ImportError:  # pragma: no cover
+    from dotenv import load_dotenv # type: ignore
+except ImportError: # pragma: no cover
     # Define a fallback loader if python-dotenv is unavailable.
     def load_dotenv(dotenv_path: str | None = None) -> None:
         """Minimal .env loader used when python-dotenv is not installed.
@@ -52,7 +54,7 @@ except ImportError:  # pragma: no cover
         Parameters
         ----------
         dotenv_path: str | None
-            Path to the .env file.  If ``None``, defaults to `.env` in
+            Path to the .env file. If ``None``, defaults to .env in
             the current working directory.
         """
         path = dotenv_path or ".env"
@@ -70,20 +72,25 @@ except ImportError:  # pragma: no cover
             # Fail silently if we can't read the file
             return
 
-import json
 from .azure_stt import recognize_once_from_file
 from .azure_tts import text_to_speech
 from .azure_llm import get_azure_openai_client, generate_response
-# Load environment variables from a `.env` file if present.  This call
+
+# Load environment variables from a .env file if present. This call
 # silently ignores missing files, so it's safe in production where
 # variables may be set differently.
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 app = FastAPI(title="Voice Chat POC (Azure)")
 
-# Configure Cross‑Origin Resource Sharing (CORS).  During development
+@app.on_event("startup")
+async def startup_event():
+    """Initializes the Azure OpenAI client at application startup."""
+    app.state.llm_client = get_azure_openai_client()
+
+# Configure Cross-Origin Resource Sharing (CORS). During development
 # we allow all origins so that a Flutter web app can connect from
-# `localhost`.  In production you should restrict this.
+# `localhost`. In production you should restrict this.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -91,7 +98,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
@@ -101,17 +107,11 @@ async def health() -> Dict[str, str]:
     """
     return {"status": "ok"}
 
-llm_client = get_azure_openai_client()
-
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     """
-    Minimal WebSocket endpoint for the POC.
-
-    Clients can connect over WebSocket and send plain text.  The server
-    simply echoes the message back with an "echo:" prefix.  In later
-    chunks this handler will stream microphone audio to Azure STT and
-    return interim transcripts and final responses.
+    WebSocket endpoint for the voice chat POC.
+    Handles both text and audio messages.
     """
     await ws.accept()
     try:
@@ -121,28 +121,28 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
             if message_type == "text":
                 text = message.get("payload", "")
-                response_text = generate_response(llm_client, text)
+                # This line is now changed to use the client from the app's state
+                response_text = generate_response(ws.app.state.llm_client, text)
                 audio_response = text_to_speech(response_text)
                 await ws.send_bytes(audio_response)
 
             elif message_type == "audio_chunk_b64":
-                import base64
                 audio_chunk_b64 = message.get("payload", "")
                 audio_chunk = base64.b64decode(audio_chunk_b64)
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp :
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                     tmp.write(audio_chunk)
                     tmp_path = tmp.name
 
                 recognized_text, _ = recognize_once_from_file(tmp_path)
                 os.unlink(tmp_path)
 
-                await ws.send_text(json.dumps({"type" : "stt_result", "text" : recognized_text}))
+                await ws.send_text(json.dumps({"type": "stt_result", "text": recognized_text}))
 
-    except WebSocketDisconnect :
+    except WebSocketDisconnect:
         return
-    except Exception as e :
-        await ws.send_text(json.dumps({"type" : "error", "message" : str(e)}))
+    except Exception as e:
+        await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
 
 
 if _HAS_MULTIPART:
@@ -152,11 +152,11 @@ if _HAS_MULTIPART:
         Recognise speech from a single uploaded audio file using Azure STT.
 
         This endpoint accepts a short audio clip and returns the recognised
-        transcript.  It is synchronous and intended only for initial
+        transcript. It is synchronous and intended only for initial
         connectivity testing—streaming recognition will be implemented
         later.
         """
-        # Save uploaded file to a temporary location.  We use a named
+        # Save uploaded file to a temporary location. We use a named
         # temporary file so that Azure STT can read from disk.
         try:
             suffix = os.path.splitext(file.filename or "")[1]
@@ -171,7 +171,7 @@ if _HAS_MULTIPART:
         finally:
             # Make sure we clean up the temporary file
             try:
-                os.unlink(tmp_path)  # type: ignore[name-defined]
+                os.unlink(tmp_path) # type: ignore[name-defined]
             except Exception:
                 pass
 else:
