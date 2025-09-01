@@ -37,16 +37,11 @@ except ImportError:  # pragma: no cover
 
 def _get_speech_config() -> speechsdk.SpeechConfig:
     """Construct and return a configured SpeechConfig instance.
-
-    Raises
-    ------
-    RuntimeError
-        If the required environment variables ``AZURE_SPEECH_KEY`` or
-        ``AZURE_SPEECH_REGION`` are missing.
-    """
+       ...
+       """
     key = os.getenv("AZURE_SPEECH_KEY")
     region = os.getenv("AZURE_SPEECH_REGION")
-    language = os.getenv("AZURE_SPEECH_LANGUAGE", "ar-EG")
+    language = os.getenv("AZURE_STT_LANGUAGE", "ar-EG")
     if not key or not region:
         raise RuntimeError(
             "Azure Speech credentials are not configured. "

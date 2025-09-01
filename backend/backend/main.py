@@ -70,8 +70,10 @@ except ImportError:  # pragma: no cover
             # Fail silently if we can't read the file
             return
 
+import json
 from .azure_stt import recognize_once_from_file
-
+from .azure_tts import text_to_speech
+from .azure_llm import get_azure_openai_client, generate_response
 # Load environment variables from a `.env` file if present.  This call
 # silently ignores missing files, so it's safe in production where
 # variables may be set differently.
@@ -99,6 +101,7 @@ async def health() -> Dict[str, str]:
     """
     return {"status": "ok"}
 
+llm_client = get_azure_openai_client()
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
@@ -113,12 +116,33 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     try:
         while True:
-            # Read incoming text
-            data = await ws.receive_text()
-            await ws.send_text(f"echo: {data}")
-    except WebSocketDisconnect:
-        # Client disconnected; nothing else to do
+            message = await ws.receive_json()
+            message_type = message.get("type")
+
+            if message_type == "text":
+                text = message.get("payload", "")
+                response_text = generate_response(llm_client, text)
+                audio_response = text_to_speech(response_text)
+                await ws.send_bytes(audio_response)
+
+            elif message_type == "audio_chunk_b64":
+                import base64
+                audio_chunk_b64 = message.get("payload", "")
+                audio_chunk = base64.b64decode(audio_chunk_b64)
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp :
+                    tmp.write(audio_chunk)
+                    tmp_path = tmp.name
+
+                recognized_text, _ = recognize_once_from_file(tmp_path)
+                os.unlink(tmp_path)
+
+                await ws.send_text(json.dumps({"type" : "stt_result", "text" : recognized_text}))
+
+    except WebSocketDisconnect :
         return
+    except Exception as e :
+        await ws.send_text(json.dumps({"type" : "error", "message" : str(e)}))
 
 
 if _HAS_MULTIPART:
