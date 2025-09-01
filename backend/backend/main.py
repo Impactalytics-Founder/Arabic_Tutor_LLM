@@ -13,13 +13,15 @@ from .azure_stt import StreamingRecognizer
 from .azure_tts import synthesize_tts_bytes, chunk_bytes
 from .azure_llm import generate_response, get_azure_openai_client
 
-# .env loader
+# Setup basic logging to see detailed messages
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 try :
     from dotenv import load_dotenv
 
     load_dotenv()
 except ImportError :
-    print("Warning: python-dotenv not found. Skipping .env file loading.")
+    logging.warning("python-dotenv not found. Skipping .env file loading.")
 
 app = FastAPI(title="Voice Chat POC (Azure Full Pipeline)")
 
@@ -44,6 +46,9 @@ async def ws_endpoint(ws: WebSocket) :
     rec: Optional[StreamingRecognizer] = None
     final_text = ""
 
+    # Get the current event loop to safely send messages from background threads.
+    loop = asyncio.get_running_loop()
+
     async def send_json(obj: Dict[str, Any]) :
         await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
@@ -56,46 +61,51 @@ async def ws_endpoint(ws: WebSocket) :
 
             if mtype == "audio_start" :
                 final_text = ""
-                sample_rate = int(payload.get("sample_rate", 16000)) if isinstance(payload, dict) else 16000
 
                 def on_partial(text: str) :
-                    if text : asyncio.create_task(send_json({"type" : "stt_partial", "payload" : text}))
+                    if text :
+                        # Use the thread-safe way to call the async function
+                        asyncio.run_coroutine_threadsafe(send_json({"type" : "stt_partial", "payload" : text}), loop)
 
                 def on_final(text: str) :
                     nonlocal final_text
                     if text :
                         final_text = text
-                        asyncio.create_task(send_json({"type" : "stt_final", "payload" : text}))
+                        # Use the thread-safe way to call the async function
+                        asyncio.run_coroutine_threadsafe(send_json({"type" : "stt_final", "payload" : text}), loop)
 
                 rec = StreamingRecognizer(language=os.getenv("AZURE_SPEECH_LANGUAGE", "ar-EG"), on_partial=on_partial,
                                           on_final=on_final)
-                rec.start(sample_rate=sample_rate)
+                rec.start()
 
             elif mtype == "audio_chunk_b64" :
                 if rec : rec.write_chunk(base64.b64decode(payload or ""))
 
             elif mtype == "audio_end" :
                 if rec :
-                    # This now blocks until the SDK confirms the session is stopped.
                     rec.stop()
                     rec = None
+
+                # Add a small, reliable delay to ensure the final callback has time to be processed
+                await asyncio.sleep(0.5)
 
                 if final_text.strip() :
                     answer = generate_response(ws.app.state.llm_client, final_text)
                     await send_json({"type" : "assistant_text", "payload" : answer})
 
-                    await send_json({"type" : "tts_start"})
                     audio = synthesize_tts_bytes(answer)
                     if audio :
-                        for part in chunk_bytes(audio, 24_000) :
+                        await send_json({"type" : "tts_start"})
+                        for part in chunk_bytes(audio, 24000) :
                             await send_json(
                                 {"type" : "tts_chunk_b64", "payload" : base64.b64encode(part).decode("ascii")})
-                    await send_json({"type" : "tts_end"})
+                        await send_json({"type" : "tts_end"})
 
     except WebSocketDisconnect :
         logging.info("WebSocket disconnected.")
     except Exception as e :
         logging.error(f"WebSocket Error: {e}", exc_info=True)
+        if rec : rec.stop()
         try :
             await send_json({"type" : "error", "payload" : str(e)})
         except Exception :
