@@ -1,0 +1,19 @@
+# Core API framework
+fastapi
+uvicorn
+
+# WebSocket client/server
+websockets
+aiohttp   # for REST testing in websocket_test.py
+
+# Env and file upload
+python-dotenv
+python-multipart
+
+# Azure services
+azure-cognitiveservices-speech   # STT/TTS
+openai>=1.0.0   # Azure OpenAI SDK (official unified client)
+
+# Optional / nice-to-have for local dev
+pydantic>=2.0   # explicit, FastAPI pulls this anyway
+aiohttp
