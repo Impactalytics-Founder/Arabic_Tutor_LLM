@@ -1,189 +1,121 @@
-"""
-FastAPI backend for the Voice Chat POC (Chunk 1 & 2).
-
-This module defines a simple API and a WebSocket endpoint. The goal of
-this proof-of-concept is to lay the groundwork for a low-latency
-voice chat system using Azure Cognitive Services. In this initial
-iteration we implement:
-
-* A health check at `/health` to verify the service is running.
-* A WebSocket endpoint at `/ws` that echoes any text payload. This
-  will be extended to stream microphone audio and transcripts in later
-  chunks.
-* A synchronous POST endpoint at `/stt/recognize_once` that accepts
-  small audio files (e.g., WAV/OGG/MP3) and returns the recognised
-  text using Azure Speech-to-Text (STT). This endpoint is intended
-  solely for sanity-checking your Azure credentials before tackling
-  streaming STT.
-
-The backend expects environment variables to be defined in a .env
-file at the repository root. See the provided .env.example for
-details.
-"""
-
 import os
-import tempfile
-import shutil
-from typing import Dict, Tuple
 import json
 import base64
+import logging
+from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-try:
-    from fastapi import UploadFile, File # type: ignore
-    # Test import from python-multipart; if missing this will raise ImportError at runtime
-    import multipart # type: ignore # noqa: F401
-    _HAS_MULTIPART = True
-except Exception:
-    # Fallback if python-multipart isn't installed. We won't register file upload routes.
-    UploadFile = None # type: ignore
-    File = None # type: ignore
-    _HAS_MULTIPART = False
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+
+# Local imports
+from .azure_stt import StreamingRecognizer
+from .azure_tts import synthesize_tts_bytes, chunk_bytes
+from .azure_llm import generate_response, get_azure_openai_client # Use our existing azure_llm
+
+# .env loader
 try:
-    from dotenv import load_dotenv # type: ignore
-except ImportError: # pragma: no cover
-    # Define a fallback loader if python-dotenv is unavailable.
-    def load_dotenv(dotenv_path: str | None = None) -> None:
-        """Minimal .env loader used when python-dotenv is not installed.
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("Warning: python-dotenv not found. Skipping .env file loading.")
 
-        Reads key=value pairs from the specified file and populates
-        ``os.environ`` for any variables that are not already set.
+app = FastAPI(title="Voice Chat POC (Azure Full Pipeline)")
 
-        Parameters
-        ----------
-        dotenv_path: str | None
-            Path to the .env file. If ``None``, defaults to .env in
-            the current working directory.
-        """
-        path = dotenv_path or ".env"
-        if not os.path.isfile(path):
-            return
-        try:
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, value = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), value.strip())
-        except Exception:
-            # Fail silently if we can't read the file
-            return
-
-from .azure_stt import recognize_once_from_file
-from .azure_tts import text_to_speech
-from .azure_llm import get_azure_openai_client, generate_response
-
-# Load environment variables from a .env file if present. This call
-# silently ignores missing files, so it's safe in production where
-# variables may be set differently.
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
-
-app = FastAPI(title="Voice Chat POC (Azure)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Be more specific in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("startup")
 async def startup_event():
     """Initializes the Azure OpenAI client at application startup."""
     app.state.llm_client = get_azure_openai_client()
 
-# Configure Cross-Origin Resource Sharing (CORS). During development
-# we allow all origins so that a Flutter web app can connect from
-# `localhost`. In production you should restrict this.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.get("/health")
-async def health() -> Dict[str, str]:
-    """Simple health check endpoint.
-
-    Returns a JSON object indicating the service is up.
-    """
+def health():
     return {"status": "ok"}
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket) -> None:
-    """
-    WebSocket endpoint for the voice chat POC.
-    Handles both text and audio messages.
-    """
+async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    rec: Optional[StreamingRecognizer] = None
+    got_final = False
+    final_text = ""
+    AZURE_SPEECH_LANGUAGE = os.getenv("AZURE_SPEECH_LANGUAGE", "ar-EG")
+
+    async def send_json(obj: Dict[str, Any]):
+        await ws.send_text(json.dumps(obj, ensure_ascii=False))
+
     try:
         while True:
-            message = await ws.receive_json()
-            message_type = message.get("type")
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await send_json({"type": "error", "payload": "invalid json"})
+                continue
 
-            if message_type == "text":
-                text = message.get("payload", "")
-                # This line is now changed to use the client from the app's state
-                response_text = generate_response(ws.app.state.llm_client, text)
-                audio_response = text_to_speech(response_text)
-                await ws.send_bytes(audio_response)
+            mtype = msg.get("type")
+            payload = msg.get("payload")
 
-            elif message_type == "audio_chunk_b64":
-                audio_chunk_b64 = message.get("payload", "")
-                audio_chunk = base64.b64decode(audio_chunk_b64)
+            if mtype == "audio_start":
+                sample_rate = int(payload.get("sample_rate", 16000)) if isinstance(payload, dict) else 16000
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                    tmp.write(audio_chunk)
-                    tmp_path = tmp.name
+                def on_partial(text: str):
+                    import asyncio
+                    asyncio.create_task(send_json({"type": "stt_partial", "payload": text}))
 
-                recognized_text, _ = recognize_once_from_file(tmp_path)
-                os.unlink(tmp_path)
+                def on_final(text: str):
+                    nonlocal got_final, final_text
+                    got_final = True
+                    final_text = text
+                    import asyncio
+                    asyncio.create_task(send_json({"type": "stt_final", "payload": text}))
 
-                await ws.send_text(json.dumps({"type": "stt_result", "text": recognized_text}))
+                rec = StreamingRecognizer(language=AZURE_SPEECH_LANGUAGE, on_partial=on_partial, on_final=on_final)
+                rec.start(sample_rate=sample_rate)
+
+            elif mtype == "audio_chunk_b64":
+                if not rec:
+                    await send_json({"type": "error", "payload": "audio_start must be sent first"})
+                    continue
+                try:
+                    chunk = base64.b64decode(payload or "")
+                    rec.write_chunk(chunk)
+                except Exception:
+                    await send_json({"type": "error", "payload": "bad base64 audio chunk"})
+
+            elif mtype == "audio_end":
+                if rec:
+                    rec.stop()
+                    rec = None
+
+                if got_final and final_text.strip():
+                    # Use azure_llm.py's generate_response function
+                    answer = generate_response(ws.app.state.llm_client, final_text)
+                    await send_json({"type": "assistant_text", "payload": answer})
+
+                    await send_json({"type": "tts_start"})
+                    audio = synthesize_tts_bytes(answer)
+                    if audio:
+                        for part in chunk_bytes(audio, 24_000):
+                            await send_json({"type": "tts_chunk_b64", "payload": base64.b64encode(part).decode("ascii")})
+                    await send_json({"type": "tts_end"})
+
+                got_final = False
+                final_text = ""
+
+            else:
+                await send_json({"type": "error", "payload": f"unknown message type: {mtype}"})
 
     except WebSocketDisconnect:
-        return
+        logging.info("WebSocket disconnected.")
     except Exception as e:
-        await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
-
-
-if _HAS_MULTIPART:
-    @app.post("/stt/recognize_once")
-    async def stt_recognize_once(file: UploadFile = File(...)) -> JSONResponse:
-        """
-        Recognise speech from a single uploaded audio file using Azure STT.
-
-        This endpoint accepts a short audio clip and returns the recognised
-        transcript. It is synchronous and intended only for initial
-        connectivity testing—streaming recognition will be implemented
-        later.
-        """
-        # Save uploaded file to a temporary location. We use a named
-        # temporary file so that Azure STT can read from disk.
+        logging.error(f"WebSocket Error: {e}")
         try:
-            suffix = os.path.splitext(file.filename or "")[1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                shutil.copyfileobj(file.file, tmp)
-                tmp_path = tmp.name
-
-            text, info = recognize_once_from_file(tmp_path)
-            return JSONResponse({"text": text, "info": info})
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        finally:
-            # Make sure we clean up the temporary file
-            try:
-                os.unlink(tmp_path) # type: ignore[name-defined]
-            except Exception:
-                pass
-else:
-    # If python-multipart is not installed, register a placeholder route
-    @app.post("/stt/recognize_once")
-    async def stt_recognize_once_unavailable() -> JSONResponse:
-        """Placeholder STT endpoint when python-multipart is missing."""
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "The /stt/recognize_once endpoint is unavailable because the "
-                "optional dependency python-multipart is not installed. "
-                "Install it with 'pip install python-multipart' to enable file uploads."
-            ),
-        )
+            await send_json({"type": "error", "payload": str(e)})
+        except Exception:
+            pass

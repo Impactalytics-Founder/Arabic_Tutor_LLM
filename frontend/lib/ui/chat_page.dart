@@ -6,10 +6,6 @@ import '../services/audio_recorder.dart';
 import 'widgets/mic_button.dart';
 import 'widgets/message_bubble.dart';
 
-/// Main chat page that composes the UI for the voice chat POC.  It
-/// connects to the WebSocket on initial build and displays log
-/// entries in a scrollable list.  Users can type messages or send
-/// audio chunks by tapping the microphone button.
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key});
 
@@ -23,7 +19,6 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
-    // Connect to the WebSocket once the first frame is rendered.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<WsClient>().connect();
     });
@@ -52,9 +47,6 @@ class _ChatPageState extends State<ChatPage> {
       ),
       body: Column(
         children: [
-          // Display the log as a chat-like list.  Each entry is
-          // prefixed with WS-> or WS<- so we use this to decide
-          // alignment.  Remove the prefix for display.
           Expanded(
             child: ListView.builder(
               padding: const EdgeInsets.all(12),
@@ -67,51 +59,28 @@ class _ChatPageState extends State<ChatPage> {
               },
             ),
           ),
-          // Text input row
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _textCtrl,
-                    decoration: const InputDecoration(
-                      hintText: 'Type a message to send via WS...',
-                      border: OutlineInputBorder(),
-                    ),
-                    onSubmitted: (_) => _sendText(ws),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: () => _sendText(ws),
-                  child: const Text('Send'),
-                ),
-              ],
-            ),
-          ),
+          // Text input is disabled in this version to focus on voice
         ],
       ),
       floatingActionButton: MicButton(
         isRecording: rec.isRecording,
         onStart: () async {
-          await context.read<AudioRecorder>().start(onChunk: (Uint8List chunk) {
-            context.read<WsClient>().sendBinary(chunk);
-          });
+          // Tell server we’re starting the audio stream
+          context.read<WsClient>().sendAudioStart(sampleRate: 16000);
+          await context.read<AudioRecorder>().start(
+            onChunk: (Uint8List chunk) {
+              // Stream microphone bytes over WebSocket
+              context.read<WsClient>().sendBinary(chunk);
+            },
+          );
         },
         onStop: () async {
           await context.read<AudioRecorder>().stop();
-          // Future: send end-of-stream signal to backend.
+          // Signal the end of the stream to the backend
+          context.read<WsClient>().sendAudioEnd();
         },
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
     );
-  }
-
-  void _sendText(WsClient ws) {
-    final text = _textCtrl.text.trim();
-    if (text.isEmpty) return;
-    ws.sendText(text);
-    _textCtrl.clear();
   }
 }

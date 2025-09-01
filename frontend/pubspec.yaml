@@ -1,5 +1,5 @@
 name: voice_chat_poc_client
-description: Flutter POC for Azure voice chat (Chunk 3)
+description: Flutter POC for Azure voice chat (Chunk 3)
 
 publish_to: "none"
 version: 0.1.0+1
@@ -19,6 +19,9 @@ dependencies:
 
   # Simple state management.
   provider: ^6.1.2
+
+  # For playing audio from the backend
+  audioplayers: ^6.1.0
 
 dev_dependencies:
   flutter_test:

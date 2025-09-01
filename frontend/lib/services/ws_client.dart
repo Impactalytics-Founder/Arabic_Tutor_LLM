@@ -1,35 +1,64 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 import '../config.dart';
 
-/// Wrapper around WebSocketChannel to manage connection state and
-/// expose simple send methods.  It also logs all inbound and outbound
-/// messages so the UI can display a chat history.
 class WsClient extends ChangeNotifier {
   WebSocketChannel? _channel;
   bool _connected = false;
   final List<String> _log = [];
 
-  /// Returns true if the WebSocket is currently connected.
-  bool get isConnected => _connected;
+  // For playing and buffering incoming audio
+  final List<int> _ttsBuffer = [];
+  final AudioPlayer _player = AudioPlayer();
 
-  /// Returns an immutable copy of the log.  Each entry is a string
-  /// prefixed with `WS->` or `WS<-` to indicate direction.
+  bool get isConnected => _connected;
   List<String> get log => List.unmodifiable(_log);
 
-  /// Initiates a connection to the server.  Does nothing if already connected.
   void connect() {
     if (_connected) return;
     try {
       _channel = WebSocketChannel.connect(Uri.parse(AppConfig.wsUrl));
       _connected = true;
       _log.add('WS: connecting to ${AppConfig.wsUrl}');
-      // Listen for incoming messages
-      _channel!.stream.listen((event) {
+
+      _channel!.stream.listen((event) async {
         final text = event is String ? event : '[binary ${event.runtimeType}]';
-        _log.add('WS<- $text');
+        try {
+          final msg = jsonDecode(text);
+          final type = msg['type'];
+          final payload = msg['payload'];
+
+          if (type == 'stt_partial') {
+            _log.add('WS<- (partial) $payload');
+          } else if (type == 'stt_final') {
+            _log.add('WS<- (final) $payload');
+          } else if (type == 'assistant_text') {
+            _log.add('WS<- (assistant) $payload');
+          } else if (type == 'tts_start') {
+            _log.add('WS<- [TTS start]');
+            _ttsBuffer.clear();
+          } else if (type == 'tts_chunk_b64') {
+            final bytes = base64Decode(payload as String);
+            _ttsBuffer.addAll(bytes);
+          } else if (type == 'tts_end') {
+            _log.add('WS<- [TTS end, playing audio]');
+            if (_ttsBuffer.isNotEmpty) {
+              await _player.stop();
+              await _player.play(BytesSource(Uint8List.fromList(_ttsBuffer)));
+            }
+          } else if (type == 'error') {
+            _log.add('WS<- [ERROR] $payload');
+          } else {
+            _log.add('WS<- $text');
+          }
+        } catch (_) {
+          _log.add('WS<- $text'); // Fallback for non-JSON messages
+        }
+
         notifyListeners();
       }, onDone: () {
         _log.add('WS: closed');
@@ -40,44 +69,44 @@ class WsClient extends ChangeNotifier {
         _connected = false;
         notifyListeners();
       });
+
+      notifyListeners();
     } catch (e) {
       _log.add('WS connect error: $e');
     }
-    notifyListeners();
   }
 
-  /// Closes the WebSocket connection if open.
   void disconnect() {
     _channel?.sink.close();
     _connected = false;
     notifyListeners();
   }
 
-  /// Sends a JSON encoded text message with a `type` and `payload`.
-  void sendText(String text) {
-    if (!_connected) {
+  void _sendMessage(Map<String, dynamic> message) {
+     if (!_connected) {
       _log.add('WS not connected');
       notifyListeners();
       return;
     }
-    final payload = jsonEncode({"type": "text", "payload": text});
-    _channel!.sink.add(payload);
-    _log.add('WS-> $payload');
+    _channel!.sink.add(jsonEncode(message));
+  }
+
+  void sendAudioStart({int sampleRate = 16000}) {
+    _sendMessage({"type": "audio_start", "payload": {"sample_rate": sampleRate}});
+    _log.add('WS-> audio_start sr=$sampleRate');
     notifyListeners();
   }
 
-  /// Sends a binary audio chunk.  In this POC the chunk is base64
-  /// encoded into a JSON message to stay compatible across platforms.
   void sendBinary(List<int> bytes) {
-    if (!_connected) {
-      _log.add('WS not connected');
-      notifyListeners();
-      return;
-    }
     final b64 = base64Encode(bytes);
-    final payload = jsonEncode({"type": "audio_chunk_b64", "payload": b64});
-    _channel!.sink.add(payload);
+    _sendMessage({"type": "audio_chunk_b64", "payload": b64});
     _log.add('WS-> [audio chunk ${bytes.length} bytes]');
+    notifyListeners();
+  }
+
+  void sendAudioEnd() {
+    _sendMessage({"type": "audio_end"});
+    _log.add('WS-> audio_end');
     notifyListeners();
   }
 }
